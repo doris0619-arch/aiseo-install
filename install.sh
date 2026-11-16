@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/doris0619-arch/aiseo-install/main/install.sh | sudo bash -s -- <安裝碼> [--domain aiseo.example.com] [--email 管理者信箱]
 #
-# 支援：Ubuntu 22.04／24.04、Debian 12（全新主機、root 權限）。可以重跑：已有的設定、主金鑰、資料庫密碼不會被換掉。
+# 支援：Ubuntu 22.04／24.04、Debian 12（root 權限；主機已有 MySQL 就沿用，不另裝 MariaDB）。可以重跑：已有的設定、主金鑰、資料庫密碼不會被換掉。
 # 安裝位置：/opt/aiseo（程式在 releases/<版本>，current 指向使用中的版本；資料在 data/）。
 # 本程式不含任何金鑰；安裝碼是唯讀下載權限，只存在這台主機 /etc/aiseo/release.key（600）。
 set -Eeuo pipefail
@@ -54,11 +54,14 @@ done
 # ── 1. 系統套件 ──
 say "安裝系統套件（Nginx、MariaDB、Redis、憑證工具）"
 export DEBIAN_FRONTEND=noninteractive
+# 主機已經有 MySQL／MariaDB 就沿用（兩者套件互斥，硬裝 MariaDB 會把原本的 MySQL 移除）
+if dpkg-query -W -f='${Status}' mysql-server 2>/dev/null | grep -q 'ok installed'; then DB_PKGS="" DB_SVC=mysql
+else DB_PKGS="mariadb-server mariadb-client" DB_SVC=mariadb; fi
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates git openssh-client xz-utils zip unzip openssl \
-  nginx mariadb-server mariadb-client redis-server certbot python3-certbot-nginx >/dev/null
-systemctl enable --now mariadb redis-server nginx >/dev/null 2>&1
-ok "系統套件"
+  nginx $DB_PKGS redis-server certbot python3-certbot-nginx >/dev/null
+systemctl enable --now $DB_SVC redis-server nginx >/dev/null 2>&1
+ok "系統套件（資料庫：$([ -z "$DB_PKGS" ] && echo "沿用原本的 MySQL" || echo MariaDB)）"
 
 # ── 2. Node 22（裝在 /opt/aiseo/node，不動系統原本的 Node） ──
 say "安裝 Node 22"
@@ -145,6 +148,7 @@ CREATE DATABASE IF NOT EXISTS aiseo CHARACTER SET utf8mb4 COLLATE utf8mb4_unicod
 CREATE USER IF NOT EXISTS 'aiseo'@'127.0.0.1' IDENTIFIED BY '$DBPASS';
 ALTER USER 'aiseo'@'127.0.0.1' IDENTIFIED BY '$DBPASS';
 GRANT ALL PRIVILEGES ON aiseo.* TO 'aiseo'@'127.0.0.1';
+GRANT ALL PRIVILEGES ON aiseo_drill.* TO 'aiseo'@'127.0.0.1';
 FLUSH PRIVILEGES;
 EOF
 ok "資料庫 aiseo"
@@ -168,8 +172,8 @@ Environment=PATH=$NODE_DIR/bin:/usr/local/bin:/usr/bin:/bin"
 cat >/etc/systemd/system/aiseo-pm2.service <<EOF
 [Unit]
 Description=AISEO (aiseo-api, aiseo-worker, aiseo-web)
-After=network-online.target mariadb.service redis-server.service
-Wants=network-online.target mariadb.service redis-server.service
+After=network-online.target $DB_SVC.service redis-server.service
+Wants=network-online.target $DB_SVC.service redis-server.service
 
 [Service]
 Type=oneshot
@@ -187,7 +191,7 @@ unit() { # 名稱 說明 指令 排程
   cat >"/etc/systemd/system/aiseo-$1.service" <<EOF
 [Unit]
 Description=$2
-After=mariadb.service
+After=$DB_SVC.service
 
 [Service]
 Type=oneshot
