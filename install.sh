@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AISEO 一行安裝（正式版主機用）。放在公開倉庫 aiseo-install；原始在開發版 tools/release/install.sh。
 #
-#   curl -fsSL https://raw.githubusercontent.com/doris0619-arch/aiseo-install/main/install.sh | sudo bash -s -- <安裝碼> [--domain aiseo.example.com] [--email 管理者信箱]
+#   curl -fsSL https://raw.githubusercontent.com/doris0619-arch/aiseo-install/main/install.sh | sudo bash -s -- <安裝碼> [--domain aiseo.example.com] [--email 管理者信箱] [--web-port 3111]
 #
 # 支援：Ubuntu 22.04／24.04、Debian 12（root 權限；主機已有 MySQL 就沿用，不另裝 MariaDB）。可以重跑：已有的設定、主金鑰、資料庫密碼不會被換掉。
 # 安裝位置：/opt/aiseo（程式在 releases/<版本>，current 指向使用中的版本；資料在 data/）。
@@ -15,7 +15,7 @@ SECRETS=$RUNTIME/secrets
 NODE_DIR=$BASE/node
 KEY_FILE=/etc/aiseo/release.key
 API_PORT=3100
-WEB_PORT=3101
+WEB_PORT=""   # 網頁埠：沒指定就用 3101，被占用時自動往後找空的；裝過的沿用 app.env
 
 say() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 ok() { printf '  \033[32m✓\033[0m %s\n' "$*"; }
@@ -28,6 +28,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --domain) DOMAIN=${2:-}; shift 2 ;;
     --email) EMAIL=${2:-}; shift 2 ;;
+    --web-port) WEB_PORT=${2:-}; shift 2 ;;
     AISEO1.*) CODE=$1; shift ;;
     *) die "看不懂的參數：$1" ;;
   esac
@@ -47,9 +48,22 @@ case "$(uname -m)" in x86_64) ARCH=x64 ;; aarch64) ARCH=arm64 ;; *) die "不支�
 MEM=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
 [ "$MEM" -ge 3500 ] || printf '  ! 記憶體只有 %s MB，建議至少 4GB\n' "$MEM"
 [ ! -d /www/server/panel ] || printf '  ! 偵測到寶塔面板：本程式會自己裝 Nginx／MariaDB／Redis，可能和寶塔裝的衝突，建議用乾淨主機\n'
-for p in $API_PORT $WEB_PORT; do
-  if ss -ltn "sport = :$p" | grep -q LISTEN && ! [ -f "$SECRETS/app.env" ]; then die "連接埠 $p 已被其他程式使用"; fi
-done
+in_use() { ss -ltn "sport = :$1" | grep -q LISTEN; }
+if [ -f "$SECRETS/app.env" ]; then
+  OLD_WEB=$(sed -n 's/^AISEO_WEB_PORT=\([0-9]*\).*/\1/p' "$SECRETS/app.env")
+  [ -n "$WEB_PORT" ] || WEB_PORT=${OLD_WEB:-3101}
+  [ "$WEB_PORT" = "${OLD_WEB:-3101}" ] || ! in_use "$WEB_PORT" || die "連接埠 $WEB_PORT 已被其他程式使用，換一個 --web-port"
+else
+  in_use $API_PORT && die "連接埠 $API_PORT 已被其他程式使用（AISEO 後端固定用這個埠）"
+  if [ -n "$WEB_PORT" ]; then in_use "$WEB_PORT" && die "連接埠 $WEB_PORT 已被其他程式使用，換一個 --web-port"
+  else
+    WEB_PORT=3101
+    while in_use $WEB_PORT; do WEB_PORT=$((WEB_PORT + 1)); [ $WEB_PORT -le 3199 ] || die "3101～3199 都被占用，請用 --web-port 指定"; done
+  fi
+fi
+case "$WEB_PORT" in '' | *[!0-9]*) die "--web-port 要是數字" ;; esac
+[ "$WEB_PORT" != "$API_PORT" ] || die "網頁埠不能和後端同一個（$API_PORT）"
+ok "網頁埠 $WEB_PORT"
 
 # ── 1. 系統套件 ──
 say "安裝系統套件（Nginx、MariaDB、Redis、憑證工具）"
@@ -137,6 +151,8 @@ EOF
   ok "已產生新設定與主金鑰"
 else
   sed -i "s#^AISEO_PUBLIC_URL=.*#AISEO_PUBLIC_URL=$PUBLIC_URL#; s#^AISEO_COOKIE_SECURE=.*#AISEO_COOKIE_SECURE=$SECURE#" "$SECRETS/app.env"
+  if grep -q '^AISEO_WEB_PORT=' "$SECRETS/app.env"; then sed -i "s#^AISEO_WEB_PORT=.*#AISEO_WEB_PORT=$WEB_PORT#" "$SECRETS/app.env"
+  else echo "AISEO_WEB_PORT=$WEB_PORT" >>"$SECRETS/app.env"; fi
   ok "沿用原本的設定（主金鑰、資料庫密碼不變）"
 fi
 DBPASS=$(sed -n 's#^AISEO_DB_URL=mysql://aiseo:\([^@]*\)@.*#\1#p' "$SECRETS/app.env")
