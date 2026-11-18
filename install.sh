@@ -36,6 +36,10 @@ done
 [ "$(id -u)" = 0 ] || die "要用 root 執行（指令前面加 sudo）"
 [ -n "$CODE" ] || [ -f "$KEY_FILE" ] || die "缺少安裝碼（AISEO1. 開頭那一長串）"
 DOMAIN=${DOMAIN#https://}; DOMAIN=${DOMAIN#http://}; DOMAIN=${DOMAIN%%/*}
+# 重跑沒帶 --domain：沿用上次的網域（不然網址會被改回 http://IP）
+if [ -z "$DOMAIN" ] && [ -f "$SECRETS/app.env" ]; then
+  DOMAIN=$(sed -n 's#^AISEO_PUBLIC_URL=https://\([^/]*\).*#\1#p' "$SECRETS/app.env" | head -1)
+fi
 
 # ── 0. 檢查主機 ──
 say "檢查主機"
@@ -230,6 +234,20 @@ EOF
 unit backup "AISEO daily database backup" "tools/backup-db.mjs --keep 14" "*-*-* 03:40:00"
 unit monitor "AISEO system monitor" "tools/monitor.mjs" "*:0/5"
 unit drill "AISEO weekly restore drill" "tools/restore-drill.mjs" "Sun *-*-* 04:30:00"
+# 一鍵更新：設定頁按「更新」→ API 啟動這個服務（跟 PM2 分開跑，重開 AISEO 時不會把自己砍掉）
+mkdir -p "$BASE/bin"
+install -m 700 "$REL/scripts/aiseo-update.sh" "$BASE/bin/aiseo-update"
+cat >/etc/systemd/system/aiseo-update.service <<EOF
+[Unit]
+Description=AISEO one-click update
+After=network-online.target $DB_SVC.service
+
+[Service]
+Type=oneshot
+$ENVLINES
+ExecStart=$BASE/bin/aiseo-update
+TimeoutStartSec=1800
+EOF
 systemctl daemon-reload
 systemctl enable aiseo-pm2.service aiseo-backup.timer aiseo-monitor.timer aiseo-drill.timer >/dev/null 2>&1
 systemctl restart aiseo-pm2.service
