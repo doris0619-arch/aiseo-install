@@ -252,15 +252,18 @@ systemctl daemon-reload
 systemctl enable aiseo-pm2.service aiseo-backup.timer aiseo-monitor.timer aiseo-drill.timer >/dev/null 2>&1
 systemctl restart aiseo-pm2.service
 systemctl start aiseo-backup.timer aiseo-monitor.timer aiseo-drill.timer
+# 裝好就先備份＋演練一次，不用等到週日才知道備份救不救得回來（背景跑，不拖慢安裝）
+(systemctl start aiseo-backup.service && systemctl start aiseo-drill.service) >/dev/null 2>&1 &
 ok "aiseo-api、aiseo-worker、aiseo-web 已啟動"
 
 # ── 8. Nginx＋HTTPS ──
+# 2026-11-20 正式機更新時這段重跑，certbot --redirect 在 80 埠加了「轉 https」：網站在 Cloudflare 後面（Cloudflare 用 http 連進來）
+# 就變成無限轉址、整站打不開。改成自己寫設定：經 Cloudflare 進 80 埠的直接服務，直接連的才轉 https；憑證只申請（certonly），不讓 certbot 改設定
 say "設定網址"
 NAME=${DOMAIN:-_}
-cat >/etc/nginx/sites-available/aiseo.conf <<EOF
-server {
-    listen 80;
-    server_name $NAME;
+CERT=/etc/letsencrypt/live/$DOMAIN
+proxy_block() {
+  cat <<EOF
     client_max_body_size 50m;
     location / {
         proxy_pass http://127.0.0.1:$WEB_PORT;
@@ -274,16 +277,47 @@ server {
         proxy_buffering off;
         proxy_read_timeout 600s;
     }
+EOF
 }
-EOF
-cat >/etc/nginx/conf.d/aiseo-map.conf <<'EOF'
-map $http_upgrade $connection_upgrade_aiseo { default upgrade; '' ''; }
-EOF
+write_nginx() { # $1=1：已有憑證，加 443，直接連 http 的轉 https
+  {
+    echo "server {"
+    echo "    listen 80;"
+    echo "    server_name $NAME;"
+    echo "    location /.well-known/acme-challenge/ { root /var/www/html; }"
+    if [ "$1" = 1 ]; then
+      echo "    # 沒有 CF-Visitor＝不是經 Cloudflare 來的，轉 https；經 Cloudflare 的直接服務（不然會無限轉址）"
+      echo "    if (\$http_cf_visitor = \"\") { return 301 https://\$host\$request_uri; }"
+    fi
+    proxy_block
+    echo "}"
+    if [ "$1" = 1 ]; then
+      echo "server {"
+      echo "    listen 443 ssl;"
+      echo "    server_name $NAME;"
+      echo "    ssl_certificate $CERT/fullchain.pem;"
+      echo "    ssl_certificate_key $CERT/privkey.pem;"
+      if [ -f /etc/letsencrypt/options-ssl-nginx.conf ]; then echo "    include /etc/letsencrypt/options-ssl-nginx.conf;"; fi
+      if [ -f /etc/letsencrypt/ssl-dhparams.pem ]; then echo "    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;"; fi
+      proxy_block
+      echo "}"
+    fi
+  } >/etc/nginx/sites-available/aiseo.conf
+}
+echo 'map $http_upgrade $connection_upgrade_aiseo { default upgrade; '"''"' '"''"'; }' >/etc/nginx/conf.d/aiseo-map.conf
+mkdir -p /var/www/html
+HAS_CERT=0
+if [ -n "$DOMAIN" ] && [ -f "$CERT/fullchain.pem" ]; then HAS_CERT=1; fi
+write_nginx $HAS_CERT
 ln -sf /etc/nginx/sites-available/aiseo.conf /etc/nginx/sites-enabled/aiseo.conf
 if [ -z "$DOMAIN" ]; then rm -f /etc/nginx/sites-enabled/default; fi
 nginx -t -q && systemctl reload nginx
 if [ -n "$DOMAIN" ]; then
-  if certbot --nginx -n --agree-tos --redirect -d "$DOMAIN" ${EMAIL:+-m "$EMAIL"} ${EMAIL:---register-unsafely-without-email} >/dev/null 2>&1; then
+  if [ "$HAS_CERT" = 1 ]; then
+    ok "HTTPS：$PUBLIC_URL（沿用現有憑證）"
+  elif certbot certonly --webroot -w /var/www/html -n --agree-tos -d "$DOMAIN" ${EMAIL:+-m "$EMAIL"} ${EMAIL:---register-unsafely-without-email} >/dev/null 2>&1; then
+    write_nginx 1
+    nginx -t -q && systemctl reload nginx
     ok "HTTPS：$PUBLIC_URL"
   else
     printf '  ! HTTPS 憑證申請失敗：請確認 %s 已指向這台主機的 IP、80／443 埠有開，再重跑一次\n' "$DOMAIN"
